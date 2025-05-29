@@ -1,0 +1,145 @@
+provider "aws" {
+  region = "us-east-1"
+}
+
+# VPC
+resource "aws_vpc" "main" {
+  cidr_block = "10.0.0.0/16"
+}
+
+# Subnet 1
+resource "aws_subnet" "subnet1" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "us-east-1a"
+}
+
+# Subnet 2
+resource "aws_subnet" "subnet2" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.2.0/24"
+  availability_zone = "us-east-1b"
+}
+
+# Security Group
+resource "aws_security_group" "ecs_sg" {
+  name        = "ecs_sg"
+  description = "Allow all inbound and outbound traffic"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# DB Subnet Group (for RDS)
+resource "aws_db_subnet_group" "medusa_db_subnet_group" {
+  name       = "medusa-db-subnet-group"
+  subnet_ids = [
+    aws_subnet.subnet1.id,
+    aws_subnet.subnet2.id
+  ]
+  tags = {
+    Name = "medusa-db-subnet-group"
+  }
+}
+
+# ECS Cluster
+resource "aws_ecs_cluster" "medusa_cluster" {
+  name = "medusa-cluster"
+}
+
+# IAM Role for ECS Task Execution
+resource "aws_iam_role" "ecs_task_execution" {
+  name = "ecsTaskExecutionRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        },
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_execution_attach" {
+  role       = aws_iam_role.ecs_task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# RDS PostgreSQL (Aurora) Cluster
+resource "aws_rds_cluster" "medusa_db" {
+  cluster_identifier      = "medusa-db"
+  engine                  = "aurora-postgresql"
+  master_username         = "medusa_admin"
+  master_password         = "yourpassword"
+  skip_final_snapshot     = true
+  vpc_security_group_ids  = [aws_security_group.ecs_sg.id]
+
+  db_subnet_group_name    = aws_db_subnet_group.medusa_db_subnet_group.name
+}
+
+# ECS Task Definition
+resource "aws_ecs_task_definition" "medusa" {
+  family                   = "medusa-task"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_task_execution.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "medusa"
+      image     = "nikhilkolambikar07/medusa-backend:latest"
+      essential = true
+      portMappings = [
+        {
+          containerPort = 9000
+          hostPort      = 9000
+        }
+      ],
+      environment = [
+        {
+          name  = "DATABASE_URL"
+          value = "postgres://admin:yourpassword@${aws_rds_cluster.medusa_db.endpoint}:5432/medusa"
+        }
+      ]
+    }
+  ])
+}
+
+# ECS Service
+resource "aws_ecs_service" "medusa_service" {
+  name            = "medusa-service"
+  cluster         = aws_ecs_cluster.medusa_cluster.id
+  task_definition = aws_ecs_task_definition.medusa.arn
+  launch_type     = "FARGATE"
+  desired_count   = 1
+
+  network_configuration {
+    subnets          = [aws_subnet.subnet1.id, aws_subnet.subnet2.id]
+    assign_public_ip = true
+    security_groups  = [aws_security_group.ecs_sg.id]
+  }
+}
+
+# Output RDS endpoint
+output "rds_endpoint" {
+  value = aws_rds_cluster.medusa_db.endpoint
+}
